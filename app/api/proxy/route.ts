@@ -33,7 +33,9 @@ export async function GET(req: NextRequest) {
         'User-Agent': 'SecureSight/1.0',
         'Connection': 'keep-alive',
       },
-      timeout: 10000, 
+      timeout: 10000,
+      // Allow self-signed certs (IP Webcam on Android uses self-signed HTTPS)
+      rejectUnauthorized: false,
     }, (upstreamRes) => {
       console.log(`[Proxy] Upstream connection successful: ${upstreamRes.statusCode}`);
       

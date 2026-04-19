@@ -7,10 +7,10 @@ opencv-python==4.11.0.86
 ultralytics==8.2.103
 # Torch optimized for inference
 torch>=2.8.0,<3.0.0
-numpy>=1.24.0,<2.0.0
+numpy>=1.24.0
 python-multipart==0.0.9
 # TensorFlow for violence detection model
-tensorflow>=2.13.0,<2.18.0
+tensorflow>=2.13.0
 # h5py for loading Keras 3 HDF5 format weights
 h5py>=3.9.0
 websockets>=12.0

@@ -41,7 +41,7 @@ class FireDetector:
             logger.info("✅ Fire model downloaded")
 
         self._model = YOLO(str(model_path))
-        self.fire_threshold = 0.50
+        self.fire_threshold = 0.35  # Lowered: catches small flames like matches/lighters
         self._ready = True
 
         # Log class names

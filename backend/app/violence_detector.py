@@ -4,13 +4,21 @@ This module provides real-time violence detection based on frame sequences.
 It uses a CNN-RNN architecture (TimeDistributed CNN + GRU) trained on video sequences.
 """
 
-import tensorflow as tf
+import logging
 import numpy as np
 import cv2
-import h5py
 from collections import deque
 from typing import Dict, Optional, Tuple
 from pathlib import Path
+
+# TensorFlow is optional — server runs without it (violence detection disabled)
+try:
+    import tensorflow as tf
+    import h5py
+    TF_AVAILABLE = True
+except ImportError:
+    TF_AVAILABLE = False
+    logging.warning("TensorFlow/h5py not installed — violence detection disabled.")
 
 # Model architecture constants (must match training) - OPTIMIZED FOR YOLO_BEST.H5
 SEQUENCE_LENGTH = 30  # Number of frames in sequence
@@ -32,16 +40,9 @@ MAX_PROB = 1 - 1e-3  # Max probability
 
 
 def build_2d_cnn_rnn_model():
-    """Build the exact CNN-RNN model architecture used in training.
-    
-    Architecture:
-    - TimeDistributed CNN: Extracts spatial features from each frame
-    - GRU: Captures temporal patterns across frames
-    - Dense: Binary classification (Violence/NonViolence)
-    
-    Returns:
-        tf.keras.Model: Compiled model ready for weight loading
-    """
+    """Build the exact CNN-RNN model architecture used in training."""
+    if not TF_AVAILABLE:
+        raise RuntimeError("TensorFlow is not installed")
     cnn_base = tf.keras.models.Sequential([
         tf.keras.layers.Input(shape=(HEIGHT, WIDTH, 3)),
         tf.keras.layers.Conv2D(16, (3, 3), activation='relu'),
@@ -116,11 +117,18 @@ class ViolenceDetector:
     """
     
     def __init__(self, model_path: str):
-        """Initialize violence detector with trained model weights.
-        
-        Args:
-            model_path: Path to .h5 weights file
-        """
+        """Initialize violence detector with trained model weights."""
+        if not TF_AVAILABLE:
+            logging.warning("ViolenceDetector: TensorFlow not available, running as stub")
+            self.model = None
+            self.frames_queue = deque(maxlen=SEQUENCE_LENGTH)
+            self.smoothed_p_non = None
+            self.current_state = "NonViolence"
+            self.violence_streak = 0
+            self.clear_streak = 0
+            self.orientation_decided = False
+            self.orientation_samples = []
+            return
         print(f"Loading violence detection model from: {model_path}")
         self.model = build_2d_cnn_rnn_model()
         
@@ -150,20 +158,11 @@ class ViolenceDetector:
         self.orientation_samples = []
         
     def add_frame(self, frame: np.ndarray) -> Dict:
-        """Process a frame and return violence detection result.
-        
-        Args:
-            frame: BGR image (H, W, 3) from OpenCV
-            
-        Returns:
-            dict: Detection result with keys:
-                - status: "collecting" | "ready"
-                - frames_collected: int (number of frames buffered)
-                - is_violence: bool (only when status="ready")
-                - violence_confidence: float 0-1 (only when status="ready")
-                - nonviolence_probability: float 0-1 (only when status="ready")
-                - state: "Violence" | "NonViolence" (only when status="ready")
-        """
+        """Process a frame and return violence detection result."""
+        if self.model is None:
+            return {"status": "ready", "is_violence": False, "violence_confidence": 0.0,
+                    "nonviolence_probability": 1.0, "state": "NonViolence",
+                    "violence_streak": 0, "clear_streak": 0}
         # Convert BGR to RGB
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         

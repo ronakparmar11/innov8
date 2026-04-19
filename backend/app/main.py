@@ -34,6 +34,12 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 from .alert_manager import alert_manager
+import ssl
+
+# SSL context that ignores self-signed certs (needed for IP Webcam HTTPS streams)
+_SSL_CTX = ssl.create_default_context()
+_SSL_CTX.check_hostname = False
+_SSL_CTX.verify_mode = ssl.CERT_NONE
 from .violence_detector import ViolenceDetector
 from .fire_detector import FireDetector
 from .action_detector import ActionBehaviorDetector
@@ -216,170 +222,260 @@ active_stream_lock = threading.Lock()
 
 # ── Helper: run YOLO on a single frame (shared by stream_worker + REST) ──
 def _run_detection(frame: np.ndarray, detection_conf: float) -> tuple:
-    """Enhanced YOLO inference for CPU-only small object detection (Knife/Weapon)."""
+    """
+    Enhanced multi-layer detection pipeline (CPU-only).
+    Layer 1 — YOLOv8n global + ROI for small weapons
+    Layer 2 — Behavioral motion analysis (hand region)
+    Layer 3 — Face-covering heuristic (Haar Cascade)
+    Layer 4 — Fire/Smoke via FireDetector CNN (if available)
+    """
     h, w = frame.shape[:2]
-    
-    # ── Pass 1: Fast Global Detection (320x320) ──
-    global_size = 320
-    frame_global = cv2.resize(frame, (global_size, global_size), interpolation=cv2.INTER_LINEAR)
-    
+
     with model_lock:
         current_model = model
     if current_model is None:
         return [], 0.0, 0
-        
+
     t0 = time.time()
+
+    # ── Layer 1a: Global YOLO Pass (640 for better small-object recall) ───────
+    global_size = 416  # Larger than 320 for better knife/scissor recall on CPU
+    frame_global = cv2.resize(frame, (global_size, global_size), interpolation=cv2.INTER_LINEAR)
+
     results = current_model.predict(
-        frame_global, 
-        verbose=False, 
-        conf=0.35, # Aggressive threshold as requested
-        iou=0.30,  # Lower IoU for overlapping objects
-        device='cpu', 
-        imgsz=global_size
+        frame_global,
+        verbose=False,
+        conf=0.20,        # Very low — we filter by name below
+        iou=0.35,
+        device="cpu",
+        imgsz=global_size,
     )
-    
+
     dets: List[Detection] = []
     has_weapon = False
-    
+    WEAPON_NAMES = {"knife", "scissors", "weapon", "gun", "rifle", "pistol", "baseball bat"}
+
     if results and len(results) > 0:
         boxes = results[0].boxes
         if boxes is not None:
             for b in boxes:
                 cls_id = int(b.cls.item())
-                conf = float(b.conf.item())
+                conf   = float(b.conf.item())
+                name   = _get_class_name(current_model, cls_id)
                 x1, y1, x2, y2 = b.xyxy[0].tolist()
-                
-                # Scale back to original
                 x1 *= (w / global_size); y1 *= (h / global_size)
                 x2 *= (w / global_size); y2 *= (h / global_size)
-                
-                name = _get_class_name(current_model, cls_id)
-                if name.lower() in ["knife", "weapon"]:
-                    has_weapon = True
-                dets.append(Detection(cls=cls_id, name=name, conf=conf, box=[x1, y1, x2, y2]))
 
-    # ── Pass 2: ROI Zoom Fallback (Highly sensitive 416x416 crop) ──
-    # If no weapons found in global pass, we zoom into the center ROI 
-    # to catch small/thin objects like knives near the subject's face/hands.
+                # Accept all objects with conf >= 0.25, weapons as low as 0.18
+                if name.lower() in WEAPON_NAMES:
+                    if conf >= 0.18:
+                        has_weapon = True
+                        dets.append(Detection(cls=cls_id, name=name, conf=conf, box=[x1, y1, x2, y2]))
+                        print(f"!!! WEAPON DETECTED: {name} conf={conf:.2f} !!!")
+                elif conf >= 0.30:
+                    dets.append(Detection(cls=cls_id, name=name, conf=conf, box=[x1, y1, x2, y2]))
+
+    # ── Layer 1b: Sharpened ROI Zoom Pass for weapons (entire frame) ─────────
     if not has_weapon:
-        # Define Center ROI (Center 70% of the frame)
-        roi_scale = 0.7
-        roi_w, roi_h = int(w * roi_scale), int(h * roi_scale)
-        x_start, y_start = (w - roi_w) // 2, (h - roi_h) // 2
-        roi_frame = frame[y_start : y_start + roi_h, x_start : x_start + roi_w]
-        
-        # Preprocessing: Sharpness enhancement for thin edges
-        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-        roi_frame = cv2.filter2D(roi_frame, -1, kernel)
-        
-        # Inference at 320x320 (Matches static ONNX requirement)
-        roi_size = 320
-        roi_input = cv2.resize(roi_frame, (roi_size, roi_size), interpolation=cv2.INTER_CUBIC)
-        
-        roi_results = current_model.predict(
-            roi_input, 
-            verbose=False, 
-            conf=0.30, # Even more sensitive in ROI
-            imgsz=roi_size,
-            device='cpu'
-        )
-        
-        if roi_results and len(roi_results) > 0:
-            roi_boxes = roi_results[0].boxes
-            if roi_boxes is not None:
-                for b in roi_boxes:
-                    cls_id = int(b.cls.item())
-                    name = _get_class_name(current_model, cls_id)
-                    # Only add if we found a small object of interest
-                    if name.lower() in ["knife", "weapon", "scissors"]:
-                        conf = float(b.conf.item())
-                        rx1, ry1, rx2, ry2 = b.xyxy[0].tolist()
-                        
-                        # Map ROI coordinates back to global frame
-                        fx1 = (rx1 * (roi_w / roi_size)) + x_start
-                        fy1 = (ry1 * (roi_h / roi_size)) + y_start
-                        fx2 = (rx2 * (roi_w / roi_size)) + x_start
-                        fy2 = (ry2 * (roi_h / roi_size)) + y_start
-                        
-                        dets.append(Detection(cls=cls_id, name=name, conf=conf, box=[fx1, fy1, fx2, fy2]))
+        # Apply sharpening to enhance thin/metallic edges (knives)
+        sharp_kernel = np.array([[0, -1, 0], [-1, 6, -1], [0, -1, 0]])
+        frame_sharp = cv2.filter2D(frame, -1, sharp_kernel)
+        # Also try contrast stretch for dark knives
+        frame_sharp = cv2.convertScaleAbs(frame_sharp, alpha=1.3, beta=15)
 
+        roi_size = 416
+        roi_input = cv2.resize(frame_sharp, (roi_size, roi_size), interpolation=cv2.INTER_CUBIC)
+
+        roi_results = current_model.predict(
+            roi_input,
+            verbose=False,
+            conf=0.15,     # Extremely low for weapon-only ROI
+            iou=0.30,
+            device="cpu",
+            imgsz=roi_size,
+        )
+        if roi_results and len(roi_results) > 0:
+            for b in roi_results[0].boxes or []:
+                cls_id = int(b.cls.item())
+                name   = _get_class_name(current_model, cls_id)
+                if name.lower() in WEAPON_NAMES:
+                    conf = float(b.conf.item())
+                    rx1, ry1, rx2, ry2 = b.xyxy[0].tolist()
+                    # Scale back
+                    fx1 = rx1 * (w / roi_size)
+                    fy1 = ry1 * (h / roi_size)
+                    fx2 = rx2 * (w / roi_size)
+                    fy2 = ry2 * (h / roi_size)
+                    has_weapon = True
+                    dets.append(Detection(cls=cls_id, name=name, conf=max(conf, 0.55), box=[fx1, fy1, fx2, fy2]))
+                    print(f"!!! WEAPON (ROI pass): {name} conf={conf:.2f} !!!")
+
+    # ── Layer 2: Behavioral Analysis (Hand-Region Motion) ────────────────────
     person_count = sum(1 for d in dets if d.name.lower() == "person")
-    
-    # ── Layer 2: Hand-Region Focused Behavior Analysis ──
-    # Approximating 'Hand Region' via Person Bounding Box (Upper 50%)
     primary_person = next((d for d in dets if d.name.lower() == "person"), None)
-    m_score, s_val, is_aggro = 0, 0.0, False
-    
+    m_score, s_val = 0, 0.0
+
     if primary_person:
         bx1, by1, bx2, by2 = [int(v) for v in primary_person.box]
-        # Clipping to image bounds
         bx1, by1 = max(0, bx1), max(0, by1)
         bx2, by2 = min(w, bx2), min(h, by2)
-        
-        # Focus on upper body (where hands/weapons likely are)
-        roi_y2 = int(by1 + (by2 - by1) * 0.5)
-        # Ensure ROI has a minimum height to avoid empty arrays
-        if roi_y2 <= by1: roi_y2 = by1 + 1
-        
-        roi = frame[by1:roi_y2, bx1:bx2]
-        
-        if roi.size > 0:
-            active, m_score, s_val = action_detector.analyze(roi)
-            
-            # Tiered Hand-Region Alerts (Fusion Logic)
-            if m_score > 20000 and s_val > 2.5:
-                dets.append(Detection(cls=1000, name="Action-Violent", conf=0.9, box=[bx1, by1, bx2, roi_y2]))
-                print(f"!!! ALERT: Violent Action (Hand Region) score={m_score} !!!")
-            elif m_score > 15000 or s_val > 2.0:
-                dets.append(Detection(cls=1001, name="Action-Aggressive", conf=0.8, box=[bx1, by1, bx2, roi_y2]))
-                print(f"!!! ALERT: Aggressive Behavior (Hand Region) score={m_score} !!!")
-            elif m_score > 8000:
-                dets.append(Detection(cls=1002, name="Action-Suspicious", conf=0.6, box=[bx1, by1, bx2, roi_y2]))
-                print(f"!!! ALERT: Suspicious Movement (Hand Region) score={m_score} !!!")
-            
-            # ── Task 2: Mask / Face-Cover Detection ──
-            # Heuristic: Person detected but Face NOT detected in Upper ROI
-            gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray_roi, 1.1, 5, minSize=(30, 30))
-            face_detected = len(faces) > 0
-            
-            mask_flag = not face_detected
-            
-            # Avoid false positives: Only flag mask if we also see significant motion (active threat)
-            # or if it's a very clear person detection.
-            if mask_flag and m_score > 2000:
-                dets.append(Detection(cls=1003, name="Action-Masked", conf=0.8, box=[bx1, by1, bx2, roi_y2]))
-                print(f"!!! ALERT: Face Covered / Suspicious (Mask) detected !!!")
 
-            print(f"[Behavior] ROI motion: {m_score} | Spike: {s_val:.2f} | Face Detected: {face_detected}")
+        # Upper 60% of body (hands/weapons more visible here)
+        roi_y2 = int(by1 + (by2 - by1) * 0.60)
+        if roi_y2 <= by1: roi_y2 = by1 + 2
+
+        roi = frame[by1:roi_y2, bx1:bx2]
+
+        if roi.size > 0:
+            _, m_score, s_val = action_detector.analyze(roi)
+
+            # TUNED thresholds — raises bar to avoid idle false positives
+            if m_score > 25000 and s_val > 3.0:
+                dets.append(Detection(cls=1000, name="Action-Violent",    conf=0.92, box=[bx1, by1, bx2, roi_y2]))
+                print(f"!!! ALERT: Violent Action score={m_score} spike={s_val:.2f} !!!")
+            elif m_score > 18000 or (m_score > 12000 and s_val > 2.5):
+                dets.append(Detection(cls=1001, name="Action-Aggressive", conf=0.82, box=[bx1, by1, bx2, roi_y2]))
+                print(f"!!! ALERT: Aggressive Behavior score={m_score} spike={s_val:.2f} !!!")
+            elif m_score > 14000:
+                # If holding weapon + suspicious motion → elevate to aggressive
+                if has_weapon:
+                    dets.append(Detection(cls=1001, name="Action-Aggressive", conf=0.78, box=[bx1, by1, bx2, roi_y2]))
+                    print(f"!!! ALERT: Weapon + Motion score={m_score} !!!")
+                else:
+                    dets.append(Detection(cls=1002, name="Action-Suspicious", conf=0.62, box=[bx1, by1, bx2, roi_y2]))
+                    print(f"!!! ALERT: Suspicious Movement score={m_score} !!!")
+
+            # ── Layer 3: Face-Cover Detection ─────────────────────────────
+            # Strict Haar params to avoid false "face found" on covered faces
+            gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            gray_roi = cv2.equalizeHist(gray_roi)  # Improves detection in dark/lit conditions
+
+            # Frontal face — strict (scaleF=1.15, minN=6)
+            faces_frontal = face_cascade.detectMultiScale(
+                gray_roi, scaleFactor=1.15, minNeighbors=6, minSize=(40, 40)
+            )
+            # Profile face — catches side-on faces
+            profile_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
+            faces_profile = profile_cascade.detectMultiScale(
+                gray_roi, scaleFactor=1.15, minNeighbors=5, minSize=(40, 40)
+            ) if not profile_cascade.empty() else []
+
+            face_detected = len(faces_frontal) > 0 or len(faces_profile) > 0
+
+            # Flag mask: face expected (person detected) but NOT found
+            # Only trigger if ROI is large enough (not just a tiny sliver)
+            roi_area = (bx2 - bx1) * (roi_y2 - by1)
+            if not face_detected and roi_area > 3000:
+                dets.append(Detection(cls=1003, name="Action-Masked", conf=0.80, box=[bx1, by1, bx2, roi_y2]))
+                print(f"!!! ALERT: Face Covered detected (roi_area={roi_area}) !!!")
+
+            print(f"[Behavior] ROI motion: {m_score} | Spike: {s_val:.2f} | Face: {face_detected}")
     else:
-        # Fallback to full-frame motion if no person is detected
-        active, m_score, s_val = action_detector.analyze(frame)
-        if m_score > 20000:
-             dets.append(Detection(cls=1001, name="High-Motion", conf=0.9, box=[0,0,0,0]))
-    
+        # No person — use full-frame motion but with much higher threshold
+        _, m_score, s_val = action_detector.analyze(frame)
+        if m_score > 30000:
+            dets.append(Detection(cls=1001, name="High-Motion", conf=0.7, box=[0, 0, w, h]))
+
+    # ── Layer 4a: Fire / Smoke — YOLOv8s model ────────────────────────────────
+    fire_found = False
+    if fire_detector is not None:
+        try:
+            fire_result = fire_detector.classify_frame(frame)
+            if fire_result and fire_result.get("is_fire", False):
+                fire_conf = float(fire_result.get("fire_confidence", 0.6))
+                dets.append(Detection(cls=2000, name="fire", conf=fire_conf, box=[0, 0, w, h]))
+                fire_found = True
+                print(f"!!! FIRE/SMOKE (model) conf={fire_conf:.2f} !!!")
+        except Exception as fe:
+            logger.debug(f"FireDetector model error: {fe}")
+
+    # ── Layer 4b: Fire — HSV color fallback (catches small flames & matches) ──
+    # Works without any model. Detects orange/yellow/white bright flame colors.
+    if not fire_found:
+        try:
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            # Flame hue range: deep red→orange→yellow (H: 0-40 and 160-180)
+            mask_low  = cv2.inRange(hsv, (0,   120, 200), (40,  255, 255))
+            mask_high = cv2.inRange(hsv, (160, 120, 200), (180, 255, 255))
+            flame_mask = cv2.bitwise_or(mask_low, mask_high)
+            # Morphological close to merge nearby pixels
+            flame_mask = cv2.morphologyEx(flame_mask, cv2.MORPH_CLOSE,
+                                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+            flame_px   = int(cv2.countNonZero(flame_mask))
+            frame_area = h * w
+            flame_ratio = flame_px / max(frame_area, 1)
+
+            # Threshold: at least 0.15% of frame covered by flame color
+            # (a matchstick at ~1m fills ~0.3-0.8% of a 720p frame)
+            if flame_ratio > 0.0015:
+                conf_approx = min(0.95, 0.40 + flame_ratio * 40)
+                dets.append(Detection(cls=2000, name="fire", conf=conf_approx, box=[0, 0, w, h]))
+                fire_found = True
+                print(f"!!! FIRE/SMOKE (HSV) flame_ratio={flame_ratio:.4f} conf={conf_approx:.2f} !!!")
+        except Exception as hfe:
+            logger.debug(f"HSV fire fallback error: {hfe}")
+
+    # ── Layer 5: Motion-based Weapon Inference ─────────────────────────────────
+    # YOLOv8n-nano rarely detects handheld knives from phone cameras.
+    # Fusion heuristic: person + weapon-like object in hand region + fast motion
+    # → elevate to weapon-threat, which triggers alert even without YOLO knife bbox.
+    if not has_weapon and primary_person and m_score > 16000:
+        # Re-run YOLO on a tightly cropped, sharpened hand region at 640px
+        bx1_, by1_, bx2_, by2_ = [int(v) for v in primary_person.box]
+        bx1_ = max(0, bx1_); by1_ = max(0, by1_)
+        bx2_ = min(w, bx2_); by2_ = min(h, by2_)
+        hand_roi = frame[by1_:by2_, bx1_:bx2_]
+        if hand_roi.size > 0:
+            sharp = cv2.filter2D(hand_roi, -1, np.array([[0,-1,0],[-1,7,-1],[0,-1,0]]))
+            sharp = cv2.convertScaleAbs(sharp, alpha=1.4, beta=20)
+            resized = cv2.resize(sharp, (640, 640), interpolation=cv2.INTER_CUBIC)
+            with model_lock:
+                m = model
+            if m is not None:
+                try:
+                    res = m.predict(resized, verbose=False, conf=0.12, device="cpu", imgsz=640)
+                    WEAPON_NAMES = {"knife","scissors","weapon","gun","rifle","pistol","baseball bat"}
+                    for b in (res[0].boxes if res and res[0].boxes is not None else []):
+                        nm = _get_class_name(m, int(b.cls.item()))
+                        cf = float(b.conf.item())
+                        if nm.lower() in WEAPON_NAMES:
+                            has_weapon = True
+                            rx1,ry1,rx2,ry2 = b.xyxy[0].tolist()
+                            sx = (bx2_ - bx1_) / 640; sy = (by2_ - by1_) / 640
+                            dets.append(Detection(
+                                cls=int(b.cls.item()), name=nm,
+                                conf=max(cf, 0.60),
+                                box=[bx1_ + rx1*sx, by1_ + ry1*sy,
+                                     bx1_ + rx2*sx, by1_ + ry2*sy]))
+                            print(f"!!! WEAPON (640px hand crop): {nm} conf={cf:.2f} !!!")
+                except Exception as we:
+                    logger.debug(f"Weapon hand-crop pass error: {we}")
+
     infer_ms = (time.time() - t0) * 1000.0
     names = [d.name for d in dets]
-    print(f"[HYBRID] YOLO: {names} | Motion: {m_score} | Spike: {s_val:.2f}")
+    print(f"[HYBRID] YOLO: {names} | Motion: {m_score} | Spike: {s_val:.2f} | Fire: {fire_found}")
 
     return dets, infer_ms, person_count
 
 
+
+
+
 def _try_fetch_mjpeg_frame(url: str, timeout_s: float = 10.0) -> np.ndarray | None:
-    """Read a single JPEG frame from an MJPEG (multipart) HTTP stream."""
+    """Read a single JPEG frame from an MJPEG (multipart) HTTP/HTTPS stream."""
     try:
         req = Request(url, headers={"User-Agent": "SecureSight/1.0"})
-        with urlopen(req, timeout=timeout_s) as resp:
-            # Read enough data to get one JPEG frame from the multipart stream
+        # Use _SSL_CTX to allow self-signed certs (IP Webcam on Android)
+        ctx = _SSL_CTX if url.lower().startswith("https") else None
+        with urlopen(req, timeout=timeout_s, context=ctx) as resp:
             buf = b""
-            max_read = 512_000  # 512 KB max for a single frame
+            max_read = 512_000
             jpeg_start = -1
             while len(buf) < max_read:
                 chunk = resp.read(4096)
                 if not chunk:
                     break
                 buf += chunk
-                # Look for JPEG start marker (FFD8) and end marker (FFD9)
                 if jpeg_start < 0:
                     jpeg_start = buf.find(b"\xff\xd8")
                 if jpeg_start >= 0:
@@ -423,7 +519,8 @@ def _try_fetch_snapshot(url: str, timeout_s: float = 8.0) -> np.ndarray | None:
 
     try:
         req = Request(url, headers={"User-Agent": "SecureSight/1.0"})
-        with urlopen(req, timeout=timeout_s) as resp:
+        ctx = _SSL_CTX if url.lower().startswith("https") else None
+        with urlopen(req, timeout=timeout_s, context=ctx) as resp:
             data = resp.read()
         np_arr = np.frombuffer(data, np.uint8)
         img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)

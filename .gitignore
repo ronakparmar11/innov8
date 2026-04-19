@@ -36,3 +36,20 @@ backend/models/*.h5
 
 # Backend persistent data (SQLite alert DB, camera config)
 backend/data/
+
+# Python virtual environment
+backend/venv/
+venv/
+.venv/
+env/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+
+# Installer executables
+python-installer.exe
+*.exe

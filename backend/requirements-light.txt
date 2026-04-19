@@ -1,0 +1,12 @@
+fastapi==0.114.2
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pydantic-settings==2.6.1
+opencv-python==4.11.0.86
+ultralytics==8.2.103
+torch>=2.8.0,<3.0.0
+numpy>=1.24.0
+python-multipart==0.0.9
+websockets>=12.0
+orjson==3.10.7
+aiofiles==23.2.1

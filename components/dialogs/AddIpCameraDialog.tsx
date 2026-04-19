@@ -35,17 +35,7 @@ export default function AddIpCameraDialog({
           u.pathname.endsWith("/stream.html") && u.searchParams.has("src");
 
         // For go2rtc viewer URLs, keep as-is so we can use WebRTC/ws directly (HLS may not be enabled)
-        if (!isGo2RtcViewer) {
-          // If external origin (not our site), route via proxy to avoid CORS issues for HTTP assets
-          if (
-            typeof window !== "undefined" &&
-            u.origin !== window.location.origin
-          ) {
-            if (u.protocol === "http:" || u.protocol === "https:") {
-              finalUrl = `/api/proxy?url=${encodeURIComponent(finalUrl)}`;
-            }
-          }
-        }
+        // We leave finalUrl as raw URL. The live/page.tsx handles the proxy wrapping.
       } catch {
         // If URL parsing fails, keep as-is
       }

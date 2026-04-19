@@ -32,9 +32,9 @@ type ParallelDetectionPayload = {
   error?: string;
 };
 
-const POLL_INTERVAL_MS = 1500; // Poll every 1.5 seconds for real-time alerts
-const MIN_SCORE = 0.65;
-const HISTORY_FETCH_INTERVAL_MS = 30000; // Fetch persistent history every 30s
+const POLL_INTERVAL_MS = 2000; // Poll every 2 seconds for real-time alerts
+const MIN_SCORE = 0.30; // Lowered from 0.65 — CPU inference has lower confidence scores
+const HISTORY_FETCH_INTERVAL_MS = 30000;
 
 // Persistent history alert type — matches backend SQLite schema
 type PersistentAlert = {
@@ -153,29 +153,20 @@ export function useParallelDetection(
             [cameraId: string]: string | undefined;
           } = {};
           cameraList.forEach((cam) => {
-            // Derive analysis URL same way as live page
             if (!cam.url) return;
-            try {
-              const u = new URL(
-                cam.url,
-                typeof window !== "undefined" ? window.location.origin : undefined,
-              );
-              const src = u.searchParams.get("src");
-              if (src && /^(https?:|rtsp:)/i.test(src)) {
-                cameraAnalysisUrls[cam.id] = src;
-              } else if (src && /^[a-zA-Z0-9_-]+$/i.test(src)) {
-                // go2rtc stream token; use MP4 stream endpoint for backend analysis
-                // (frame.jpeg requires ffmpeg; stream.mjpeg broken behind Cloudflare;
-                //  stream.mp4 works reliably with OpenCV VideoCapture)
-                cameraAnalysisUrls[cam.id] = `${u.origin}/api/stream.mp4?src=${encodeURIComponent(src)}`;
-              } else {
-                const isAbsolute = /^(https?:|rtsp:)/i.test(u.href);
-                if (isAbsolute) {
-                  cameraAnalysisUrls[cam.id] = u.href;
+            const url = cam.url.trim();
+            // Accept any direct http/https/rtsp URL — send straight to backend
+            if (/^(https?:|rtsp:)/i.test(url)) {
+              cameraAnalysisUrls[cam.id] = url;
+            } else {
+              // It's a proxy URL — extract the original URL from ?url= param
+              try {
+                const u = new URL(url, window.location.origin);
+                const orig = u.searchParams.get("url") || u.searchParams.get("src");
+                if (orig && /^(https?:|rtsp:)/i.test(orig)) {
+                  cameraAnalysisUrls[cam.id] = orig;
                 }
-              }
-            } catch {
-              // Skip invalid URLs
+              } catch { /* skip malformed */ }
             }
           });
 
@@ -192,13 +183,16 @@ export function useParallelDetection(
           });
 
           if (!response.ok) {
-            if (response.status === 404) {
-              console.warn("⚠️ Detection endpoint /api/detect-all not available.");
+            if (
+              response.status === 404 ||
+              response.status === 500 ||
+              response.status === 503 ||
+              response.status === 502
+            ) {
               setErrorMessage(
-                "AI detection endpoint not available. Check server logs.",
+                `Backend unreachable (HTTP ${response.status}). Ensure the AI server is running.`,
               );
               setStatus("error");
-              stopPolling();
               return;
             }
             throw new Error(`HTTP ${response.status}`);
@@ -209,7 +203,9 @@ export function useParallelDetection(
           if (isCleaningUpRef.current) return;
 
           if (data.error) {
-            console.warn("Parallel detection error:", data.error);
+            // Only update state, do not spam the console on every poll loop
+            setErrorMessage(data.error);
+            setStatus("error");
             return;
           }
 
@@ -227,31 +223,50 @@ export function useParallelDetection(
             // Handle alerts for this camera
             if (result.alerts && result.alerts.length > 0) {
               const ts = result.ts ? result.ts * 1000 : Date.now();
-              const label = result.alerts[0];
-              const topScore = result.detections?.[0]?.conf ?? 0;
 
-              // Get last alert for this camera
-              let lastAlert = lastAlertRef.current.get(cameraId);
-              const shouldTrigger =
-                !lastAlert ||
-                lastAlert.label !== label ||
-                ts - lastAlert.ts > 3000;
-
-              if (topScore >= minScore && shouldTrigger) {
-                lastAlert = { label, ts };
-                lastAlertRef.current.set(cameraId, lastAlert);
-
-                const camera = cameraList.find((c) => c.id === cameraId);
-                newAlerts.push({
-                  id: `${Math.floor(ts)}-${cameraId}-${label}-${Math.random()}`,
-                  cameraId,
-                  cameraName: camera?.name || `Camera ${cameraId}`,
-                  label,
-                  score: topScore,
-                  ts,
-                  source: cameraAnalysisUrls[cameraId] ?? "",
+              // Process EVERY triggered alert (not just alerts[0])
+              for (const alertLabel of result.alerts) {
+                // Find the confidence of the detection that MATCHES this alert
+                const matchingDet = result.detections?.find((d: { name: string; conf: number }) => {
+                  const n = d.name.toLowerCase();
+                  const al = alertLabel.toLowerCase();
+                  return (
+                    al.includes("weapon")     && ["knife","scissors","weapon","gun","rifle","pistol"].includes(n) ||
+                    al.includes("fire")       && n === "fire" ||
+                    al.includes("violence")   && n.includes("action-violent") ||
+                    al.includes("aggressive") && n.includes("action-aggressive") ||
+                    al.includes("suspicious") && n.includes("action-suspicious") ||
+                    al.includes("face")       && n.includes("action-masked") ||
+                    al.includes("person")     && n === "person"
+                  );
                 });
+                // If no matching det found, use the highest-conf detection or fallback 0.7
+                const topScore = matchingDet?.conf
+                  ?? Math.max(...(result.detections?.map((d: { conf: number }) => d.conf) ?? [0]), 0.7);
+
+                let lastAlert = lastAlertRef.current.get(`${cameraId}:${alertLabel}`);
+                const shouldTrigger =
+                  !lastAlert ||
+                  lastAlert.label !== alertLabel ||
+                  ts - lastAlert.ts > 3000;
+
+                if (topScore >= minScore && shouldTrigger) {
+                  lastAlert = { label: alertLabel, ts };
+                  lastAlertRef.current.set(`${cameraId}:${alertLabel}`, lastAlert);
+
+                  const camera = cameraList.find((c) => c.id === cameraId);
+                  newAlerts.push({
+                    id: `${Math.floor(ts)}-${cameraId}-${alertLabel}-${Math.random().toString(36).slice(2)}`,
+                    cameraId,
+                    cameraName: camera?.name || `Camera ${cameraId}`,
+                    label: alertLabel,
+                    score: topScore,
+                    ts,
+                    source: cameraAnalysisUrls[cameraId] ?? "",
+                  });
+                }
               }
+
             }
           }
 

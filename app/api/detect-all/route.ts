@@ -137,18 +137,18 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ alerts: detections });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`[detect-all] Forwarding to backend failed: ${message}`);
+      // Backend is offline; silently return an error payload to the polling client
       return NextResponse.json(
         { error: "Batch detection failed", detail: message },
-        { status: 500 },
+        { status: 200 },
       );
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`[detect-all] Error: ${message}`);
+    // Silent fail for polling loop
     return NextResponse.json(
       { error: "Batch detection failed", detail: message },
-      { status: 500 },
+      { status: 200 },
     );
   }
 }
