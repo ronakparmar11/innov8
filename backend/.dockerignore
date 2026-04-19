@@ -1,0 +1,13 @@
+# Exclude local clutter
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+.venv
+node_modules
+*.log
+.DS_Store

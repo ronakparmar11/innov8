@@ -1,0 +1,20 @@
+fastapi==0.114.2
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pydantic-settings==2.6.1
+# Use the non-headless OpenCV that ultralytics pulls; keep only one to avoid conflicts
+opencv-python==4.11.0.86
+ultralytics==8.2.103
+# Torch optimized for inference
+torch>=2.8.0,<3.0.0
+numpy>=1.24.0,<2.0.0
+python-multipart==0.0.9
+# TensorFlow for violence detection model
+tensorflow>=2.13.0,<2.18.0
+# h5py for loading Keras 3 HDF5 format weights
+h5py>=3.9.0
+websockets>=12.0
+# Performance optimization
+orjson==3.10.7
+aiofiles==23.2.1
+

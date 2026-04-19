@@ -1,0 +1,10 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build Next.js App",
+			"type": "shell",
+			"command": "cd '/Users/yashpatel/Desktop/PROJECTS  /ss_site/SecureSight-Technologies' && npx next build 2>&1"
+		}
+	]
+}
